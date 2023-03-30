@@ -1,4 +1,4 @@
-# fly.toml file generated for patgpt-telegram on 2023-03-29T11:24:57-07:00
+# fly.toml file generated for patgpt-telegram on 2023-03-29T15:04:01-07:00
 
 app = "patgpt-telegram"
 kill_signal = "SIGINT"

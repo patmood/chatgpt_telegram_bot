@@ -1,22 +1,22 @@
 from typing import Optional, Any
 
-import pymongo
+import redis
 import uuid
 from datetime import datetime
+import json
+import logging
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
     def __init__(self):
-        self.client = pymongo.MongoClient(config.mongodb_uri)
-        self.db = self.client["chatgpt_telegram_bot"]
-
-        self.user_collection = self.db["user"]
-        self.dialog_collection = self.db["dialog"]
+        self.redis_client = redis.Redis.from_url(config.redis_url)
 
     def check_if_user_exists(self, user_id: int, raise_exception: bool = False):
-        if self.user_collection.count_documents({"_id": user_id}) > 0:
+        if self.redis_client.exists(f"user:{user_id}"):
             return True
         else:
             if raise_exception:
@@ -32,67 +32,66 @@ class Database:
         first_name: str = "",
         last_name: str = "",
     ):
-        user_dict = {
-            "_id": user_id,
-            "chat_id": chat_id,
-
-            "username": username,
-            "first_name": first_name,
-            "last_name": last_name,
-
-            "last_interaction": datetime.now(),
-            "first_seen": datetime.now(),
-
-            "current_dialog_id": None,
-            "current_chat_mode": "assistant",
-            "current_model": config.models["available_text_models"][0],
-
-            "n_used_tokens": {},
-
-            "n_transcribed_seconds": 0.0  # voice message transcription
-        }
-
+        user_key = f"user:{user_id}"
         if not self.check_if_user_exists(user_id):
-            self.user_collection.insert_one(user_dict)
+            user_dict = {
+                "chat_id": chat_id,
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+                "last_interaction": datetime.now().isoformat(),
+                "first_seen": datetime.now().isoformat(),
+                "current_dialog_id": json.dumps(None),
+                "current_chat_mode": "assistant",
+                "current_model": config.models["available_text_models"][0],
+                "n_used_tokens": json.dumps({}),
+                "n_transcribed_seconds": 0.0,
+            }
+            self.redis_client.hmset(user_key, user_dict)
 
     def start_new_dialog(self, user_id: int):
         self.check_if_user_exists(user_id, raise_exception=True)
 
         dialog_id = str(uuid.uuid4())
+        dialog_key = f"dialog:{dialog_id}"
         dialog_dict = {
-            "_id": dialog_id,
             "user_id": user_id,
             "chat_mode": self.get_user_attribute(user_id, "current_chat_mode"),
-            "start_time": datetime.now(),
+            "start_time": datetime.now().isoformat(),
             "model": self.get_user_attribute(user_id, "current_model"),
-            "messages": []
+            "messages": json.dumps([]),
         }
 
         # add new dialog
-        self.dialog_collection.insert_one(dialog_dict)
+        self.redis_client.hmset(dialog_key, dialog_dict)
 
         # update user's current dialog
-        self.user_collection.update_one(
-            {"_id": user_id},
-            {"$set": {"current_dialog_id": dialog_id}}
-        )
+        self.set_user_attribute(user_id, "current_dialog_id", dialog_id)
 
         return dialog_id
 
     def get_user_attribute(self, user_id: int, key: str):
         self.check_if_user_exists(user_id, raise_exception=True)
-        user_dict = self.user_collection.find_one({"_id": user_id})
+        user_key = f"user:{user_id}"
+        value = self.redis_client.hget(user_key, key)
 
-        if key not in user_dict:
-            return None
+        # If the value is bytes, decode it to a string
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
 
-        return user_dict[key]
+        # If the value is a JSON string, load it back to a Python object
+        if key in ["n_used_tokens"]:
+            value = json.loads(value)
+
+        return value
 
     def set_user_attribute(self, user_id: int, key: str, value: Any):
         self.check_if_user_exists(user_id, raise_exception=True)
-        self.user_collection.update_one({"_id": user_id}, {"$set": {key: value}})
+        self.redis_client.hset(f"user:{user_id}", key, value)
 
-    def update_n_used_tokens(self, user_id: int, model: str, n_input_tokens: int, n_output_tokens: int):
+    def update_n_used_tokens(
+        self, user_id: int, model: str, n_input_tokens: int, n_output_tokens: int
+    ):
         n_used_tokens_dict = self.get_user_attribute(user_id, "n_used_tokens")
 
         if model in n_used_tokens_dict:
@@ -101,10 +100,12 @@ class Database:
         else:
             n_used_tokens_dict[model] = {
                 "n_input_tokens": n_input_tokens,
-                "n_output_tokens": n_output_tokens
+                "n_output_tokens": n_output_tokens,
             }
 
-        self.set_user_attribute(user_id, "n_used_tokens", n_used_tokens_dict)
+        self.set_user_attribute(
+            user_id, "n_used_tokens", json.dumps(n_used_tokens_dict)
+        )
 
     def get_dialog_messages(self, user_id: int, dialog_id: Optional[str] = None):
         self.check_if_user_exists(user_id, raise_exception=True)
@@ -112,16 +113,21 @@ class Database:
         if dialog_id is None:
             dialog_id = self.get_user_attribute(user_id, "current_dialog_id")
 
-        dialog_dict = self.dialog_collection.find_one({"_id": dialog_id, "user_id": user_id})
-        return dialog_dict["messages"]
+        dialog_key = f"dialog:{dialog_id}"
+        messages = self.redis_client.hget(dialog_key, "messages")
+        if messages:
+            messages = messages.decode("utf-8")
+            return json.loads(messages)
+        else:
+            return []
 
-    def set_dialog_messages(self, user_id: int, dialog_messages: list, dialog_id: Optional[str] = None):
+    def set_dialog_messages(
+        self, user_id: int, dialog_messages: list, dialog_id: Optional[str] = None
+    ):
         self.check_if_user_exists(user_id, raise_exception=True)
 
         if dialog_id is None:
             dialog_id = self.get_user_attribute(user_id, "current_dialog_id")
 
-        self.dialog_collection.update_one(
-            {"_id": dialog_id, "user_id": user_id},
-            {"$set": {"messages": dialog_messages}}
-        )
+        dialog_key = f"dialog:{dialog_id}"
+        self.redis_client.hset(dialog_key, "messages", json.dumps(dialog_messages))
