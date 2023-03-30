@@ -135,5 +135,4 @@ site
 
 **/docker-compose.dev.yml
 
-**/mongodb
 fly.toml
